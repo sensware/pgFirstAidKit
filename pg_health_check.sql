@@ -46,6 +46,15 @@
 --     script reports that as a finding instead of failing.
 --   * Bloat figures are estimates from planner statistics. Confirm with the
 --     pgstattuple extension before a rewrite.
+--   * Missing indexes: PostgreSQL does not record which WHERE / JOIN columns
+--     queries filter on, so no script can name the exact index to create. This
+--     one triangulates from five angles: foreign keys without an index, large
+--     tables read by sequential scans (with candidate columns and the statements
+--     that mention the table), large tables with no index at all, index scans
+--     that walk a big part of the index, and statements that touch many pages
+--     to return few rows. Treat the result as a short list to confirm with
+--     EXPLAIN (ANALYZE, BUFFERS); the HypoPG extension can test an index
+--     without building it.
 --   * Not visible from SQL and therefore NOT covered: host CPU, memory, swap,
 --     disk latency and free space. Use OS tooling, or CloudWatch / Performance
 --     Insights / Enhanced Monitoring on AWS.
@@ -117,6 +126,9 @@
 \if :{?pss_top} \else \set pss_top 10 \endif
 \if :{?pss_share_warn} \else \set pss_share_warn 20 \endif
 \if :{?pss_mean_ms} \else \set pss_mean_ms 1000 \endif
+-- Pages (8kB blocks) a statement may touch per call before it is suspected of
+-- missing an index, when it returns few rows
+\if :{?pss_blks_per_call} \else \set pss_blks_per_call 10000 \endif
 
 -- -----------------------------------------------------------------------------
 -- 2. Session guard rails.
@@ -283,6 +295,8 @@ idx as (            -- indexes on those tables
          ci.relpages::bigint * env.bs       as bytes,
          ci.reloptions,
          coalesce(si.idx_scan, 0)           as idx_scan,
+         coalesce(si.idx_tup_read, 0)       as idx_tup_read,   -- index entries walked
+         t.reltuples                        as table_tuples,
          -- true when the index implements a PRIMARY KEY / UNIQUE / EXCLUDE constraint
          exists (select 1 from pg_constraint k where k.conindid = i.indexrelid) as backs_constraint
     from pg_index i
@@ -380,6 +394,7 @@ pss as (            -- pg_stat_statements with version-independent column names
   select x.j ->> 'queryid'                                               as queryid,
          coalesce(d.datname::text, 'db ' || (x.j ->> 'dbid'))            as dbname,
          left(regexp_replace(coalesce(x.j ->> 'query', ''), '\s+', ' ', 'g'), 200) as q,
+         lower(regexp_replace(coalesce(x.j ->> 'query', ''), '\s+', ' ', 'g'))     as q_lower,
          (x.j ->> 'calls')::numeric                                      as calls,
          coalesce(x.j ->> 'total_exec_time', x.j ->> 'total_time')::numeric as total_ms,
          coalesce(x.j ->> 'mean_exec_time',  x.j ->> 'mean_time')::numeric  as mean_ms,
@@ -830,7 +845,7 @@ findings (sev, category, check_name, object_name, current_value, details, action
       and b.indcollation::text like a.indcollation::text || ' %'
     order by 8 desc limit :top_n)
 
-  union all   -- parent DELETE/UPDATE must scan the whole child table
+  union all   -- MISSING INDEX, angle 1: parent DELETE/UPDATE must scan the whole child table
   (select 'MEDIUM', 'Indexes', 'Foreign key without index', t.fq,
           k.conname || ' (' || (select string_agg(a.attname, ', ' order by u.ord)
                                   from unnest(k.conkey) with ordinality u(attnum, ord)
@@ -852,16 +867,70 @@ findings (sev, category, check_name, object_name, current_value, details, action
                          and (i.indkey::int2[])[0 : cardinality(k.conkey) - 1] @> k.conkey)
     order by 8 desc limit :top_n)
 
-  union all   -- large tables that are read front to back again and again
-  (select 'MEDIUM', 'Indexes', 'Frequent sequential scans on a large table', t.fq,
+  union all   -- MISSING INDEX, angle 2: large tables read front to back again and again
+  (select 'MEDIUM', 'Indexes', 'Likely missing index: sequential scans on a large table', t.fq,
           t.seq_scan || ' seq scans reading ' || round(t.seq_tup_read / t.seq_scan) || ' rows each on average; '
             || coalesce(t.idx_scan, 0) || ' index scans; ~' || t.n_live_tup || ' rows',
-          'Queries regularly read most of this table. That usually means a WHERE or JOIN column has no usable index.',
-          'Find the statements in pg_stat_statements, check them with EXPLAIN, and add the missing index.',
+          'Queries regularly read a large part of this table, which usually means a WHERE or JOIN column has no usable index.'
+            || coalesce(' Candidate columns (selective, not the first column of any index): ' || c.cols || '.',
+                        ' No selective un-indexed column found in the statistics; the filter may be an expression or a low-selectivity column.')
+            || coalesce(' Statements that mention the table: ' || q.stmts || '.', ''),
+          'Run EXPLAIN (ANALYZE, BUFFERS) on those statements and index the column(s) in their WHERE / JOIN: CREATE INDEX CONCURRENTLY ON '
+            || t.fq || ' (<column>); Put equality columns first, then range / ORDER BY columns.',
           t.seq_tup_read
+     from (select t0.* from tbl t0
+            where t0.seq_scan >= :seqscan_min and t0.n_live_tup >= :seqscan_min_rows
+              and t0.seq_tup_read / t0.seq_scan >= 0.1 * :seqscan_min_rows
+            order by t0.seq_tup_read desc limit :top_n) t
+     -- columns worth indexing: many distinct values, narrow, and not already leading an index
+     left join lateral (
+       select string_agg(x.attname || ' (~' || round(x.nd) || ' distinct values)', ', ' order by x.nd desc) as cols
+         from (select ps.attname,
+                      case when ps.n_distinct < 0 then -ps.n_distinct * t.reltuples else ps.n_distinct end as nd
+                 from pg_stats ps
+                where ps.schemaname = t.nspname and ps.tablename = t.relname and not ps.inherited
+                  and (ps.n_distinct < -0.01 or ps.n_distinct >= 100)
+                  and ps.avg_width <= 100
+                  and not exists (select 1 from pg_index i
+                                    join pg_attribute a on a.attrelid = i.indrelid and a.attnum = i.indkey[0]
+                                   where i.indrelid = t.oid and i.indisvalid and a.attname = ps.attname)
+                order by 2 desc limit 5) x
+     ) c on true
+     -- the heaviest read statements whose text contains the table name (needs pg_stat_statements)
+     left join lateral (
+       select string_agg('queryid ' || x.queryid || ' (' || x.calls || ' calls, mean ' || round(x.mean_ms, 1) || ' ms)',
+                         '; ' order by x.total_ms desc) as stmts
+         from (select p.queryid, p.calls, p.mean_ms, p.total_ms
+                 from pss p
+                where p.dbname = current_database()
+                  and p.q_lower ~ ('\m' || regexp_replace(lower(t.relname), '([^a-z0-9_])', '\\\1', 'g') || '\M')
+                  and p.q_lower ~ '^\W*(select|with|update|delete|merge)\M'
+                order by p.total_ms desc limit 3) x
+     ) q on true
+    order by 8 desc)
+
+  union all   -- MISSING INDEX, angle 3: nothing to use at all
+  (select 'MEDIUM', 'Indexes', 'Large table without any index', t.fq,
+          '~' || t.reltuples::bigint || ' rows, ' || pg_size_pretty(t.bytes) || ', '
+            || coalesce(t.seq_scan, 0) || ' sequential scans so far',
+          'With no index every lookup, join, UPDATE and DELETE on this table reads all of it.',
+          'Add a primary key and index the columns used to find rows. Leave it alone only if it is an append-only staging or log table that is always read in full.',
+          t.bytes
      from tbl t
-    where t.seq_scan >= :seqscan_min and t.n_live_tup >= :seqscan_min_rows
-      and t.seq_tup_read / t.seq_scan >= 0.1 * :seqscan_min_rows
+    where t.relkind in ('r', 'm') and t.reltuples >= :seqscan_min_rows
+      and not exists (select 1 from tbl_idx ti where ti.indrelid = t.oid)
+    order by 8 desc limit :top_n)
+
+  union all   -- MISSING INDEX, angle 4: an index exists but does not narrow the search enough
+  (select 'LOW', 'Indexes', 'Index scans walk a large part of the index', i.fq,
+          i.idx_scan || ' scans reading ' || round(i.idx_tup_read / i.idx_scan) || ' entries each on average (table has ~'
+            || i.table_tuples::bigint || ' rows)',
+          'Index on ' || i.table_fq || '. Each scan reads 10% or more of the table''s rows through this index, so the queries using it filter on further columns the index does not contain, or the leading column is not selective.',
+          'Look at the statements using this index. A composite index (equality columns first) or a partial index usually fixes it. Ignore if these are intentional range reports.',
+          i.idx_tup_read
+     from idx i
+    where i.idx_scan >= :seqscan_min and i.table_tuples >= :seqscan_min_rows
+      and i.idx_tup_read / i.idx_scan >= 0.1 * i.table_tuples
     order by 8 desc limit :top_n)
 
   union all   -- every index is extra work on every write
@@ -1233,6 +1302,22 @@ findings (sev, category, check_name, object_name, current_value, details, action
           p.mean_ms
      from pss p
     where p.mean_ms >= :pss_mean_ms and p.calls >= 5
+    order by 8 desc limit :pss_top)
+
+  union all   -- MISSING INDEX, angle 5: a lot of data read to return very little
+  (select 'MEDIUM', 'Queries', 'Likely missing index: many pages read for few rows',
+          'queryid ' || p.queryid || ' (' || p.dbname || ')',
+          round((p.blks_hit + p.blks_read) / p.calls) || ' pages ('
+            || pg_size_pretty(((p.blks_hit + p.blks_read) / p.calls * env.bs)::bigint) || ') touched per call for '
+            || round(p.n_rows / p.calls, 1) || ' rows; ' || p.calls || ' calls, mean ' || round(p.mean_ms, 1) || ' ms',
+          p.q,
+          'EXPLAIN (ANALYZE, BUFFERS): look for "Seq Scan" with "Rows Removed by Filter" and index the filtered columns. Expected (ignore) for aggregates that must read a whole table, e.g. count(*).',
+          p.blks_hit + p.blks_read
+     from pss p cross join env
+    where p.calls >= 5
+      and (p.blks_hit + p.blks_read) / p.calls >= :pss_blks_per_call
+      and p.n_rows / p.calls <= 100
+      and p.q_lower ~ '^\W*(select|with|update|delete|merge)\M'
     order by 8 desc limit :pss_top)
 
   union all
